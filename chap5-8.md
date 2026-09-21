@@ -631,17 +631,289 @@ spec:
 
 ---
 
-> 📌 **다음에 나올 내용 (예고)**
-> 위 예시는 PVC를 **개념 이해용으로 단독 작성**한 것이다. 실제 taskapp의 mysql 배포 시에는 **PVC 매니페스트를 별도로 정의하지 않고**, StatefulSet 안에 `volumeClaimTemplates`를 포함시켜 파드가 생성될 때마다 전담 PVC가 자동으로 생성되는 방식을 사용한다.
->
-> ```
-> 직접 PVC 작성하는 방식        StatefulSet의 volumeClaimTemplates 방식
-> PVC 매니페스트 따로 작성   →   StatefulSet 안에 PVC "틀"만 정의
->   ↓                              ↓
-> 파드가 그 PVC를 참조         파드 생성 시마다 전담 PVC 자동 생성
-> ```
+---
 
+## StatefulSet — 상태 유지 레플리카셋
 
+**스테이트풀셋 = 상태 유지 레플리카셋.** 파드 복제, 컨테이너/환경변수 정의는 레플리카셋과 동일. 차이는 `volumeClaimTemplates`로 파드마다 전담 PVC를 자동 생성한다는 점.
+
+| | 레플리카셋 | 스테이트풀셋 |
+|---|---|---|
+| 파드 이름 | 랜덤, 재생성마다 바뀜 | `mysql-0` 등 **고정 식별자**, 재생성돼도 유지 |
+| 적합 대상 | 무상태 앱 (api, web) | 상태 유지 앱 (mysql) |
+
+**Q. api/web과 mysql이 둘 다 "회원 조회/생성" 같은 행위를 하는 건 같은데 왜 다르게 취급하나?**
+→ 행위가 같냐가 기준이 아니라 **결과 데이터가 어디 저장되냐**가 기준. api는 처리 결과를 mysql에 저장하므로 api 자신은 상태가 없음(stateless) → 아무 파드가 처리해도 무관. mysql은 자기 볼륨에 직접 저장하므로 **그 데이터를 가진 그 파드**가 응답해야 함 → 지목 필요.
+
+**mysql.yaml 핵심 구성:**
+- 이미지: `ghcr.io/jpubdocker/taskapp-mysql` (compose 때와 달리 완성된 이미지 사용, 태그 없음)
+- 비밀번호: 시크릿을 볼륨 마운트 → 그 파일 경로를 `MYSQL_ROOT_PASSWORD_FILE` 등 환경변수로 지정 (매니페스트에 평문 노출 안 함)
+- `clusterIP: None` → **Headless 서비스**. DB는 로드밸런싱되면 안 되므로 필수
+- `serviceName: "mysql"` → 파드에 `mysql-0.mysql`이라는 **불변 호스트명** 부여
+
+**Q. IP 대신 호스트명이 필요한 이유, `mysql-0`에 직접 접속한다는 게 무슨 뜻?**
+→ 파드 IP는 재생성마다 바뀌지만 호스트명은 안 바뀜. "mysql-0에 접속"은 API를 거치지 않고 **직접 SQL 실행/백업/디버깅**할 때를 말함 (api는 아무 파드나 접속해도 되지만 DB는 데이터를 가진 그 파드를 정확히 찍어야 함).
+
+**결과 확인:** `mysql-0` 파드 생성 → PVC(`mysql-data-mysql-0`)가 **손으로 안 만들었는데 자동 생성**되어 `Bound` 확인. `volumeClaimTemplates`가 파드 이름과 조합해 PVC를 자동으로 찍어낸 것.
+
+**Q. `mysql-0`이 PV냐?**
+→ 아님. `mysql-0`은 파드. PVC는 `mysql-data-mysql-0`, 그게 Bound된 실제 PV는 `pvc-e16f6a66-...`. 셋 다 다른 리소스.
+
+**Q. `ReadWriteOnce`가 "한 번만 읽고 쓴다"는 뜻이냐?**
+→ 아니고 "**하나의 노드**에서만 마운트 가능"이라는 뜻. 횟수 제한이 아니라 동시 접근 가능한 노드 개수 제한.
+
+---
+
+## Job — 데이터베이스 마이그레이터
+
+레플리카셋/스테이트풀셋은 "파드가 계속 살아있어야 한다"고 가정. migrator는 **한 번 실행하고 끝나야 하는 작업**이라 Job이 필요.
+
+**Q. Job이 파드보다 상위 개념이냐?**
+→ 아니다. 레플리카셋·스테이트풀셋과 **같은 급**의, 파드를 만드는 방식이 다른 리소스. 파드가 끝났을 때 반응이 다를 뿐:
+- 레플리카셋 등: 파드 종료 → 다시 만듦 (계속 재시작 루프 위험)
+- **Job**: 파드가 정상 종료(Exit 0)하면 → 그대로 둠
+
+**migrator.yaml 핵심:**
+- `apiVersion: batch/v1` (파드/서비스의 `v1`, 디플로이먼트의 `apps/v1`과 다른 그룹)
+- `env`는 대부분 평문, **비밀번호만** 시크릿 파일 경로로 `args`에 전달
+- `restartPolicy: Never` — Job에 필수, 재시작 안 함을 명시
+
+**결과:** `migrator-up-xxx` 파드가 `STATUS: Completed`, `READY: 0/1`로 남음 — 정상. (5.10의 Job 파드들과 같은 패턴)
+
+---
+
+## API 서버 배포
+
+API는 상태 없는 앱이라 **디플로이먼트**로 구축. `nginx-api` + `api` 두 컨테이너를 가진 파드 (사이드카 구조).
+
+**핵심:**
+- `BACKEND_HOST: "localhost:8180"` — 같은 파드 내 api 컨테이너를 localhost로 호출 (파드 IP 공유)
+- `secret.items` — 시크릿 안 특정 키만 골라 원하는 파일명으로 마운트
+- 서비스는 nginx-api의 포트(80)를 바라봄 — api 컨테이너 자체는 8180
+
+apply 결과: `deployment.apps/api created`, `service/api created`. `READY 2/2` 확인.
+
+---
+
+## Web 서버 배포 (6.2.3 마무리)
+
+**Init 컨테이너**가 새로 등장: 본 컨테이너보다 먼저 실행되는 전처리 전용 컨테이너.
+
+**필요한 이유:** `nginx-web`이 정적 파일(assets)을 참조해야 하는데, compose 때는 web-nginx 간 공유 볼륨으로 해결했음. 쿠버네티스에서도 공유 볼륨(`emptyDir: {}`)을 만들고, **Init 컨테이너가 이미지 안의 assets를 그 볼륨에 복사**해두는 방식으로 재현.
+
+**핵심:**
+- `initContainers`는 `containers`보다 먼저 실행되고 끝나야 본 컨테이너 시작
+- Init 컨테이너와 web 컨테이너가 같은 이미지 사용 (이미지 안에 assets 포함)
+- `web` 컨테이너의 `--api-address=http://api:80` → **다른 서비스**(api)를 이름으로 호출 (localhost 아님)
+- Ingress `host: localhost`로 로컬 접속 경로 완성
+
+**apply 결과:** Deployment, Service, Ingress 세 개 생성. `ingress`의 `ADDRESS`가 `localhost`가 되면 요청 수신 가능 상태. 브라우저에서 `http://localhost` 접속 → Task Management Application 화면 표시. **taskapp 전체(mysql→migrator→api→web) 로컬 배포 완료.**
+
+---
+
+## 6.3 클라우드(AKS) 배포
+
+로컬 인그레스는 온라인 공개 불가. **Azure Kubernetes Service(AKS)**로 클라우드에 배포해 실제 온라인 공개.
+
+**컨텍스트(context)** — 여러 클러스터를 다룰 때 조작 대상을 전환하는 설정. `kubectl config get-contexts`로 확인, `az aks get-credentials`로 AKS 컨텍스트 병합.
+
+**배포 흐름은 로컬과 완전히 동일** (시크릿 → mysql → migrator → api), **인그레스만 다름:**
+- 로컬: `ingressClassName: nginx` (Ingress NGINX Controller)
+- AKS: `ingressClassName: azure-application-gateway` (AGIC, Application Gateway Ingress Controller)
+
+apply 후 `kubectl get ingress web`의 `ADDRESS`에 **글로벌 IP**가 할당됨 → 그 IP로 실제 인터넷에서 접속 가능.
+
+**매니지드 쿠버네티스 대시보드:** AKS는 Azure portal에서 웹 기반으로 리소스 상태/파드 로그를 거의 실시간 확인 가능. GKE, EKS도 유사한 대시보드 제공.
+
+**학습 종료 후 클러스터 삭제 필수** (비용 방지):
+```bash
+az group delete --name jpub --yes --no-wait
+```
+---
+
+## Web 서버 배포 — 6.2.3 마무리
+
+**Init 컨테이너** 개념 등장: 본 컨테이너보다 먼저 실행되는 전처리 전용 컨테이너.
+```
+둘 다 한 번 뜨고 끝난다 라는 공통점으로 인해 헷갈려?
+Job         → 독립된 새 파드를 하나 만듦 (migrator-up-xxxxx)
+Init 컨테이너 → 기존 파드 안의 컨테이너 목록에 하나 끼어들어감 (web 파드 안의 init)
+** kubectl get pod 하면 web-xxxxx라는 파드 하나만 보임. init은 그 안에 숨어있어서 별도 파드로 안 보임
+```
+
+**필요한 이유:** `nginx-web`이 정적 파일(assets)을 참조해야 하는데, compose 때는 web-nginx 간 공유 볼륨으로 해결했음. 
+쿠버네티스에서도 공유 볼륨(`emptyDir: {}`)을 만들고, **Init 컨테이너가 이미지 안의 assets를 그 볼륨에 복사**해두는 방식으로 재현.
+```컴포즈때 기억안나서~
+compose 때는 공유볼륨. 즉 web 컨테이너와 nginx-web 컨테이너가 하나의 볼륨을 서로 동시에 마운트하여 사용함.
+직접 주고받는 게 아니라 중간에 공용 저장 공간(볼륨)을 뒀다는 뜻.
+그걸 쿠버네티스에서는 파드 안에 컨테이너들이 emptyDir 볼륨 하나를 공유하는 구조로 그대로 옮긴 것.
+
+근데 왜 Init 컨테이너가 필요해졌냐???
+compose 때는 web 컨테이너가 뜰 때 자기가 알아서 자기 assets를 볼륨에 복사하는 로직이 있었을 수 있는데(또는 시작 스크립트로), 
+쿠버네티스 매니페스트에서는 그런 커스텀 로직을 다시 정의하는 게 번거로워서 
+— "assets 복사"라는 그 한 가지 작업만 전담하는 별도 컨테이너(Init)를 만들어서 처리한 것.
+```
+
+**핵심:**
+- `initContainers`는 `containers`보다 먼저 실행되고, 끝나야 본 컨테이너가 시작됨
+- Init 컨테이너와 web 컨테이너가 같은 이미지 사용 (이미지 안에 assets 포함되어 있어서)
+- `web` 컨테이너의 `--api-address=http://api:80`[파드 내부에서 나가는 요청] → **다른 서비스**(api)를 이름으로 호출 (같은 파드가 아니므로 localhost 아님)
+- Ingress `host: localhost`로 로컬 접속 경로 완성 [브라우저에서 들어오는 요청] → 실제 회사 서비스라면 host: myapp.com이었을 텐데, 로컬 실습이라 진짜 도메인이 없어서 그냥 localhost를 도메인처럼 쓴 것
+
+**apply 결과:** Deployment, Service, Ingress 세 개 생성. `ingress`의 `ADDRESS`가 `localhost`가 되면 요청 수신 가능 상태.
+
+**브라우저에서 `http://localhost` 접속 → Task Management Application 화면 표시.**
+
+→ **taskapp 전체(mysql → migrator → api → web)를 로컬 쿠버네티스에 배포 완료.**
+
+---
+
+## 6.3 클라우드(AKS) 배포 
+
+### 왜 클라우드 배포가 필요한가
+
+로컬 인그레스는 **온라인에 공개할 수 없음.** 실제 서비스로 배포하려면 클라우드의 매니지드 쿠버네티스가 필요하며, 책은 **Azure Kubernetes Service(AKS)**를 예시로 사용.
+
+### 컨텍스트(Context)
+
+여러 클러스터를 다룰 때 조작 대상을 전환하는 설정.
+
+```bash
+kubectl config get-contexts
+```
+
+로컬(`docker-desktop`)과 AKS(`jpub-aks`) 등 여러 클러스터가 목록에 뜨고, `CURRENT`에 `*` 표시된 게 현재 조작 대상. `az aks get-credentials`로 AKS 클러스터 정보를 kubeconfig에 병합해 전환.
+
+### 배포 흐름은 로컬과 동일, 인그레스만 다름
+
+시크릿 → mysql(StatefulSet) → migrator(Job) → api(Deployment) 순서는 **로컬과 완전히 동일.**
+
+차이는 인그레스 컨트롤러:
+| 환경 | 컨트롤러 |
+|---|---|
+| 로컬 (Docker Desktop) | Ingress NGINX Controller (ingressClassName: nginx) |
+| AKS | Application Gateway Ingress Controller, AGIC (ingressClassName: azure-application-gateway) |
+
+apply 후 `kubectl get ingress`의 `ADDRESS`에 **글로벌 IP**가 할당되며, 이 IP로 실제 인터넷에서 접속 가능해짐.
+
+### 매니지드 쿠버네티스의 대시보드
+
+AKS는 **Azure portal**에서 웹 기반으로 리소스 상태와 파드 로그를 거의 실시간 확인 가능. GKE(구글), EKS(AWS)도 유사한 대시보드 제공. 매니지드 서비스는 쿠버네티스 외 컴포넌트(로드밸런서, DNS 등)도 함께 연동되는 경우가 많아 이런 대시보드가 유용함.
+
+### 실습 시 주의사항 (참고용)
+
+AKS는 **켜져 있는 시간만큼 과금**되는 서비스이므로, 실제로 실습했다면 학습 종료 후 클러스터를 반드시 삭제해야 함:
+
+```bash
+az group delete --name <리소스그룹명> --yes --no-wait
+```
+
+### 참고 — 자체 도메인/HTTPS로 공개하기
+
+실제 운영에서는 IP가 아닌 **도메인 + HTTPS**로 서비스해야 함. 클라우드별 DNS·인증서 서비스:
+
+| 클라우드 | DNS 서비스 | SSL/TLS 인증서 |
+|---|---|---|
+| 구글 클라우드 | Cloud DNS | Certificate Manager |
+| AWS | Route 53 | AWS Certificate Manager |
+| Azure | Azure DNS | Azure Key Vault |
+
+또는 오픈소스 **cert-manager**를 사용하면 **Let's Encrypt**(무료 인증기관)로 인증서 발급·자동 갱신까지 가능.
+
+### 참고 — kubectx / kubens
+
+여러 클러스터·네임스페이스를 자주 전환할 때 쓰는 편의 도구.
+
+```bash
+kubectx docker-desktop   # 컨텍스트 전환
+kubectx -                 # 이전 컨텍스트로 복귀
+kubens taskapp             # 기본 네임스페이스 설정 → 이후 -n taskapp 생략 가능
+```
+---
+
+## [실습 완료] Web 서버 배포 — 6.2.3 마무리
+
+**Init 컨테이너** 개념 등장: 본 컨테이너보다 먼저 실행되는 전처리 전용 컨테이너.
+
+**필요한 이유:** `nginx-web`이 정적 파일(assets)을 참조해야 하는데, compose 때는 web-nginx 간 공유 볼륨으로 해결했음. 쿠버네티스에서도 공유 볼륨(`emptyDir: {}`)을 만들고, **Init 컨테이너가 이미지 안의 assets를 그 볼륨에 복사**해두는 방식으로 재현.
+
+**핵심:**
+- `initContainers`는 `containers`보다 먼저 실행되고, 끝나야 본 컨테이너가 시작됨
+- Init 컨테이너와 web 컨테이너가 같은 이미지 사용 (이미지 안에 assets 포함되어 있어서)
+- `web` 컨테이너의 `--api-address=http://api:80` → **다른 서비스**(api)를 이름으로 호출 (같은 파드가 아니므로 localhost 아님)
+- Ingress `host: localhost`로 로컬 접속 경로 완성
+
+**apply 결과:** Deployment, Service, Ingress 세 개 생성. `ingress`의 `ADDRESS`가 `localhost`가 되면 요청 수신 가능 상태.
+
+**브라우저에서 `http://localhost` 접속 → Task Management Application 화면 표시.**
+
+→ **taskapp 전체(mysql → migrator → api → web)를 로컬 쿠버네티스에 배포 완료.**
+
+---
+
+## [책 내용 정리] 6.3 클라우드(AKS) 배포 — 실습은 진행하지 않음
+
+> ⚠️ 아래 내용은 책의 진행 흐름 이해를 위한 정리이며, **실제로 AKS 클러스터를 만들거나 배포하는 실습은 하지 않았음.** 지금까지의 실습은 전부 로컬(Docker Desktop) 환경에서만 진행됨. 따라서 클러스터 삭제 등 비용 관련 조치도 해당 없음.
+
+### 왜 클라우드 배포가 필요한가
+
+로컬 인그레스는 **온라인에 공개할 수 없음.** 실제 서비스로 배포하려면 클라우드의 매니지드 쿠버네티스가 필요하며, 책은 **Azure Kubernetes Service(AKS)**를 예시로 사용.
+
+### 컨텍스트(Context)
+
+여러 클러스터를 다룰 때 조작 대상을 전환하는 설정.
+
+```bash
+kubectl config get-contexts
+```
+
+로컬(`docker-desktop`)과 AKS(`jpub-aks`) 등 여러 클러스터가 목록에 뜨고, `CURRENT`에 `*` 표시된 게 현재 조작 대상. `az aks get-credentials`로 AKS 클러스터 정보를 kubeconfig에 병합해 전환.
+
+### 배포 흐름은 로컬과 동일, 인그레스만 다름
+
+시크릿 → mysql(StatefulSet) → migrator(Job) → api(Deployment) 순서는 **로컬과 완전히 동일.**
+
+차이는 인그레스 컨트롤러:
+| | 컨트롤러 |
+|---|---|
+| 로컬 (Docker Desktop) | Ingress NGINX Controller (`ingressClassName: nginx`) |
+| AKS | Application Gateway Ingress Controller, **AGIC** (`ingressClassName: azure-application-gateway`) |
+
+apply 후 `kubectl get ingress`의 `ADDRESS`에 **글로벌 IP**가 할당되며, 이 IP로 실제 인터넷에서 접속 가능해짐.
+
+### 매니지드 쿠버네티스의 대시보드
+
+AKS는 **Azure portal**에서 웹 기반으로 리소스 상태와 파드 로그를 거의 실시간 확인 가능. GKE(구글), EKS(AWS)도 유사한 대시보드 제공. 매니지드 서비스는 쿠버네티스 외 컴포넌트(로드밸런서, DNS 등)도 함께 연동되는 경우가 많아 이런 대시보드가 유용함.
+
+### 실습 시 주의사항 (참고용)
+
+AKS는 **켜져 있는 시간만큼 과금**되는 서비스이므로, 실제로 실습했다면 학습 종료 후 클러스터를 반드시 삭제해야 함:
+
+```bash
+az group delete --name <리소스그룹명> --yes --no-wait
+```
+
+### 참고 — 자체 도메인/HTTPS로 공개하기
+
+실제 운영에서는 IP가 아닌 **도메인 + HTTPS**로 서비스해야 함. 클라우드별 DNS·인증서 서비스:
+
+| 클라우드 | DNS 서비스 | SSL/TLS 인증서 |
+|---|---|---|
+| 구글 클라우드 | Cloud DNS | Certificate Manager |
+| AWS | Route 53 | AWS Certificate Manager |
+| Azure | Azure DNS | Azure Key Vault |
+
+또는 오픈소스 **cert-manager**를 사용하면 **Let's Encrypt**(무료 인증기관)로 인증서 발급·자동 갱신까지 가능.
+
+### 참고 — kubectx / kubens
+
+여러 클러스터·네임스페이스를 자주 전환할 때 쓰는 편의 도구.
+
+```bash
+kubectx docker-desktop   # 컨텍스트 전환
+kubectx -                 # 이전 컨텍스트로 복귀
+kubens taskapp             # 기본 네임스페이스 설정 → 이후 -n taskapp 생략 가능
+```
 
 ---
 
