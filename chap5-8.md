@@ -915,24 +915,542 @@ kubectx -                 # 이전 컨텍스트로 복귀
 kubens taskapp             # 기본 네임스페이스 설정 → 이후 -n taskapp 생략 가능
 ```
 
----
-
----
-
----
-
----
 
 ---
 # Chap 7. 쿠버네티스 활용
 
 ---
 
----
+## 7.1 파드 배포 전략
+
+컨테이너로 애플리케이션을 배포하는 시대가 되면서 배포 전략도 바뀜.
+
+[📖] 컨테이너를 통한 배포는 각 노드가 컨테이너 이미지를 가져오는 PULL타입 배포 -> 배포와 스케일 아웃이 쉽다.
+
+-> 배포할 때 누가 누구한테 파일을 옮기느냐의 차이를 말하는 것.
+
+```예전방식
+[예전 방식]
+
+배포 담당자/스크립트 ──scp──▶ 서버1
+                    ──scp──▶ 서버2
+                    ──scp──▶ 서버3   (서버가 늘면 목록도 스크립트도 다 고쳐야 함)
+```
+- 서버 목록을 **배포하는 쪽**이 들고 있어야 함. 서버가 하나 늘면 그 목록에 직접추가.
+- 파일을 보낸 다음에도 서버마다 접속해서 압축 풀고, 재시작하고, 순서 맞추는 스크립트가 필요.
+- 책에서 말하는 "번거로운 방식"
+
+```컨테이너방식
+[컨테이너 방식]
+
+           레지스트리 (ghcr.io, Docker Hub)
+          ▲          ▲          ▲
+        pull       pull       pull
+          │          │          │
+        노드1      노드2      노드3
+```
+- 배포 하는 쪽은 이미지를 레지스트리에 한 번 올리고, 매니페스트에 image: ...:v.0.0.2 이런식으로 적기만 하면 됨.
+- 그럼 파드가 배치된 노드의 kubelet이 그 이미지를 직접 받아 실행
+- 배포하는 쪽은 노드가 몇 대인지, 어떤 노드인지 몰라도 상관 X
+
+#### 🔎그래서 왜 "배포와 스케일 아웃이 쉽다"는 거임?
+
+| 상황 | PUSH (예전 방식) | PULL (컨테이너 방식) |
+|---|---|---|
+| 새 버전 배포 | 서버마다 파일을 보내는 스크립트 실행 | 매니페스트의 이미지 태그만 변경 |
+| 같은 앱 3개 → 10개로 늘리기 | 새 서버에 실행 환경 세팅 + 파일 전송 | `replicas: 10` 수정. 파드가 배치된 노드가 알아서 이미지를 pull |
+| 서버(노드) 추가 | 배포 스크립트의 서버 목록 수정 | 클러스터에 노드를 붙이기만 하면 끝 |
+
+- 핵심: 이미지 안에 실행 환경까지 다 들어 있어서 노드는 "받아서 실행"만 하면 됨
+- 그래서 노드 수가 늘어도 배포하는 쪽이 할 일은 늘지 않음
+
+#### 🔎스케일 아웃?
+처리할 사람(대수)을 늘려서 감당할 수 있는 양을 키우는 것.
+
+- 스케일 업 => 요리사 한 명을 더 빠르 셰프로 교체 => 서버 한 대의 CPU·메모리를 업그레이드
+- 스케일 아웃 => 요리사를 3명에서 10명으로 늘림 => 같은 앱을 띄운 서버(파드)를 3개에서 10개로 늘림
+
+즉, `replicas: 10` 수정 .. 이 부분이 스케일 아웃이라는 거임. 
+
+예전에는 서버를 한 대 늘릴때마다 실행 환경 깔고 랄지 부르스 해야해서 그 자체가 일이었는데, 컨테이너는 저 `replicas` 숫자만 바꾸면 새 파드가 뜬 노드가 이미지를 알아서 받아오니까 늘리는 비용이 거의 0이 된 셈이라는 뜻~!~!~!~!~!~!
+
+#### 🔎kubelet은 뭐에요
+
+- **모든 노드에 하나씩 떠 있는 관리 프로그램(에이전트)**
+- 컨트롤 플레인이 "이 노드에서 이 파드 돌려"라고 정하면, 그걸 노드에서 **실제로 실행**하는 주체
+
+| 구성 요소 | 위치 | 역할 |
+|---|---|---|
+| kube-scheduler | 컨트롤 플레인 | 파드를 **어느 노드에** 놓을지 결정 |
+| kubelet | 각 노드 | 배정된 파드를 **실행하고 계속 감시** |
+| kube-proxy | 각 노드 | 서비스 IP → 파드 IP 네트워크 규칙 관리 (5장) |
+
+1. API 서버를 감시하다가 자기 노드에 배정된 파드를 발견
+2. 컨테이너 런타임(containerd)에 이미지 pull + 컨테이너 실행 지시 → **PULL 타입 배포의 실제 수행자**
+3. liveness/readiness probe 실행 (7.1.2), liveness 실패 시 컨테이너 재시작
+4. 파드 상태(Running, READY 0/1 등)를 API 서버에 계속 보고
+
+
+~파드 배포 전략 실습~
+
+### 7.1.1 RollingUpdate
+
+-> 우리 이거 5장에서 디플로이먼트 배울 때 들었던 개념!
+
+다시 한 번 설명하자면 [📖]구 버전의 애플리케이션을 실행한 상태에서 새 버전의 애플리케이션을 가동하고 준비가 완료된 것 부터 순서대로 교체하는 구조.
+
+```📸chap7-롤링업데이트
+우리가 5장에서 롤링업데이트를 실습한 적이 있으나, 그와 다른 점은
+5장에서는 레플리카셋 목록과 리비전(쿠버네티스 안쪽 시점)이었다면,
+지금 확인하는 건 사용자 시점을 더 한 것!
+가짜 사용자(update-checker)가 요청을 보내고 그 응답이 어떻게 왔는지를 자기 로그에 기록하여 우리가 확인.
+
+
+앱이 응답하는 버전 문자열(VERSION=cb76260)은 이미지 태그가 아니라, 이미지를 빌드할 때 git에서 읽어온 값인데, 빌드 시점에 git 태그를 찾으면 v0.0.2처럼 태그 이름이 들어가고, 못 찾으면 대신 커밋 해시(cb76260)가 들어감. v0.0.1 이미지는 태그를 못 찾은 상태로 빌드돼서 해시가 찍힌 것..
+```
+
+#### update-checker 요청이 응답을 받기까지
+
+```text
+update-checker 파드
+   │ curl http://print-version/
+   ▼
+CoreDNS: "print-version" → 서비스 IP          
+   ▼
+kube-proxy: 서비스 IP → 실제 파드 IP 중 하나  
+   ▼
+print-version 파드 → "VERSION=v0.0.2" 응답
+   ▼
+update-checker가 받아서 echo
+```
+- 로그 한 줄 = `[update-checker가 찍은 시각] + print-version이 보낸 응답`
+
+#### 이미지 변경 방법 비교: edit / patch / set image
+
+| 비교 | `kubectl edit` | `kubectl patch` | `kubectl set image` |
+|---|---|---|---|
+| 방식 | 에디터로 매니페스트를 열어 직접 수정 | 바꿀 부분만 JSON으로 전달 | 이미지 전용 단축 명령 |
+| 에디터 | 열림 | 안 열림 | 안 열림 |
+| 바꿀 수 있는 것 | 아무 필드나 | 아무 필드나 | 이미지만 |
+| 적합한 상황 | 사람이 직접 확인하며 수정 | 스크립트·CI 자동화 | 이미지만 빠르게 교체 |
+| 적용 후 동작 | RollingUpdate 시작 | 동일 | 동일 |
+
+```bash
+# edit: 에디터가 열리면 v0.0.1 → v0.0.2로 직접 고치고 저장
+KUBE_EDITOR=nano kubectl edit deployment/print-version
+
+# patch: 매니페스트 경로(spec.template.spec.containers)를 JSON으로 지정
+kubectl patch deployment/print-version -p '{"spec":{"template":{"spec":{"containers":[{"name":"print-version","image":"ghcr.io/jpubdocker/print-version:v0.0.2"}]}}}}'
+
+# set image: 컨테이너이름=새이미지
+kubectl set image deployment/print-version print-version=ghcr.io/jpubdocker/print-version:v0.0.2
+```
+
+- 세 방법 모두 결과는 동일함 (디플로이먼트 image 필드 변경 → 새 레플리카셋 → RollingUpdate)
+- 차이는 "누가, 어떻게 지시하느냐"뿐
+
+#### RollingUpdate 동작 제어: maxUnavailable / maxSurge
+
+파드가 여러 개일 때 **한 번에 몇 개씩 교체할지** 정하는 설정
+
+```yaml
+spec:
+  replicas: 4
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 3
+      maxSurge: 4
+```
+
+| 설정 | 의미 | 기본값 | 리스트 7.4 값 (replicas 4) | 결과 |
+|---|---|---|---|---|
+| `maxUnavailable` | 교체 중 **동시에 내려가 있어도 되는** 파드 최대 수 | replicas의 25% (소수점 내림) | `3` | 4개 중 3개까지 동시에 내려도 됨 → 최소 1개는 항상 살아 있어야 함 |
+| `maxSurge` | replicas보다 **추가로 더 띄워도 되는** 파드 최대 수 | replicas의 25% (소수점 올림) | `4` | 4개를 추가로 띄워도 됨 → 순간 최대 8개까지 존재 가능 |
+
+→ 시작하자마자 새 파드 4개 생성 + 옛 파드 3개 종료, 새 파드가 Ready 되면 남은 1개 종료
+
+**트레이드오프**
+
+| 크게 잡으면 | 장점 | 단점 |
+|---|---|---|
+| `maxUnavailable` ↑ | 교체가 빨라짐 | 남은 파드에 트래픽이 몰림 |
+| `maxSurge` ↑ | 교체가 빨라짐 | 순간적으로 CPU·메모리가 더 필요함 |
+
+- 책의 권장: 처음에는 `maxUnavailable: 1`로 하나씩 교체하는 게 안전함
+- 참고: replicas 1이면 기본값이 maxUnavailable 0(내림), maxSurge 1(올림) → "하나도 내리면 안 되고 하나는 더 띄워도 됨" → 그래서 앞 실습에서 **새 파드를 먼저 띄우고 옛 파드를 내렸음**
+
+#### 🔎트레이드 오프가 뭐에요
+하나를 얻으면 다른 하나를 내줘야 하는 관계.
+
+### 7.1.2 컨테이너 실행 시 상태 체크 설정하기
+
+| 부분 | kubelet이 하는 검사 | 통과 조건 |
+|---|---|---|
+| `livenessProbe` → `exec: cat /var/tmp/live.txt` | 컨테이너 안에서 `cat` 명령을 실행해 봄 | 파일이 있으면 OK (이미지에 미리 들어 있음) |
+| `initialDelaySeconds: 3`, `periodSeconds: 5` | 뜨고 3초 뒤부터 5초마다 검사 | - |
+| `readinessProbe` → `httpGet: /hc :8080` | 컨테이너의 8080 포트로 HTTP 요청 | 200번대 응답이 오면 OK |
+| `initialDelaySeconds: 15` | 뜨고 15초 동안은 검사를 안 함 → 그동안 계속 Not Ready | - |
+| `timeoutSeconds: 3` | 3초 안에 응답이 없으면 실패로 처리 | - |
+
+- liveness 실패 → 컨테이너 **재시작**
+- readiness 실패 → 재시작 없이 **서비스 대상에서 제외** (요청을 안 보냄)
+
+
+(`kubectl rollout restart` 후 관찰)
+
+📸chap7-컨테이너 상태체크.png
+| 줄 | 시점 | 의미 |
+|---|---|---|
+| `0/1 Running 1s` | 컨테이너 시작 | 프로세스는 떴지만 아직 **Not Ready** → 서비스가 요청을 보내지 않음 |
+| (약 21초 대기) | | readiness 검사 전 대기(`initialDelaySeconds: 15`) + 첫 검사·보고 시간 |
+| `1/1 Running 22s` | readiness 통과 | 이제야 서비스 대상에 포함 |
+| `Terminating 105s` | 바로 다음 | 새 파드가 Ready가 된 **뒤에야** 옛 파드 종료 |
+
+- 핵심: **Running인데 0/1인 구간** = 파드는 떴지만 앱은 아직 응답할 준비가 안 된 상태
+- 15초가 아니라 21초인 이유: 15초는 검사를 "시작하는" 시점이고, 검사·보고에 몇 초가 더 걸림
+
+#### probe 없을 때 vs readinessProbe 있을 때
+
+| 비교 | probe 없음 | readinessProbe 있음 |
+|---|---|---|
+| Running → 1/1 | 거의 동시 (약 4초) | 약 21초 |
+| 옛 파드 종료 시점 | 새 파드가 Running 되자마자 | 새 파드가 **readiness를 통과한 뒤** |
+| Ready 판단 기준 | "프로세스가 떴다" | "앱이 실제로 응답했다" |
+
+- probe가 없으면 프로세스만 떠도 Ready로 보고 옛 파드를 바로 내림
+- Spring Boot처럼 기동이 오래 걸리는 앱은 그 사이 요청이 준비 안 된 새 파드로 가서 에러 발생 → readinessProbe로 방지
 
 ---
 
+#### COLUMN: 안전하게 애플리케이션을 중지하고 파드 삭제하기 (Graceful Shutdown)
+
+**파드 종료 순서**
+
+```text
+① 파드 삭제 명령
+② preStop 훅 실행 (설정했을 때만)
+③ SIGTERM 전송 → 앱이 정리 후 종료
+④ terminationGracePeriodSeconds (기본 30초) 대기
+⑤ 안 끝나면 SIGKILL → 강제 종료
+```
+
+| 상황 | 해결책 |
+|---|---|
+| 종료 정리가 오래 걸리는 앱 (DB 등) | `terminationGracePeriodSeconds: 60`처럼 대기 시간 늘리기 |
+| SIGTERM에 즉시 죽는 앱 (nginx) | `lifecycle.preStop`에서 `nginx -s quit` 먼저 실행 |
+| 종료 중 파드로 요청이 새는 문제 (실습에서 겪은 2분 멈춤) | `preStop`에 `sleep 5` 등으로 서비스 목록 갱신 시간 확보 (책 외 보충) |
+
+- 원인: "파드 종료"와 "Endpoints에서 제거"가 동시에 따로 진행됨 → 그 틈에 요청이 죽어가는 파드로 감
+
+>즉, 파드 삭제 명령이 떨어지면 terminationGracePeriodSeconds 카운트가 시작돼. preStop이 설정돼 있으면 먼저 실행되고, 그다음 SIGTERM 신호가 가서 앱이 정리를 해. 이 모든 게 정해진 시간 안에 끝나야 하고, 시간이 지나도 안 끝나면 SIGKILL 신호로 강제 종료돼.
+
+** Graceful Shutdown: 누가 어디서 다루나
+
+| 항목 | 어디에 쓰나 | 누가 담당 |
+|---|---|---|
+| `preStop` | **매니페스트** (`lifecycle.preStop`) | 우리가 설정 → kubelet이 실행 |
+| `terminationGracePeriodSeconds` | **매니페스트** (파드 spec) | 우리가 설정 → kubelet이 그만큼 기다림 |
+| SIGTERM 보내기 | 안 씀 (자동) | kubelet이 알아서 보냄 |
+| SIGTERM 받아서 정리하기 | **앱 코드** (2장 main.go의 `signal.Notify`) | 개발자가 앱에 구현 |
+| SIGKILL 보내기 | 안 씀 (자동) | 시간 초과 시 kubelet이 알아서 보냄 |
+
+- 매니페스트: 종료 과정을 **조율** (먼저 할 일, 최대 대기 시간)
+- 앱 코드: SIGTERM을 받으면 처리 중인 요청을 마무리하고 **스스로 종료**
+- 쿠버네티스: SIGTERM → (시간 초과 시) SIGKILL을 **자동으로** 전송
+- 매니페스트와 앱 코드가 둘 다 준비돼야 Graceful Shutdown이 제대로 동작함
 ---
 
+### 7.1.3 Blue-Green Deployment
+= 구버전과 신버전이 혼재하는 시간이 발생하는데, 이것이 의도치 않은 부작용이 발생할 수 있다.  
+이 방법을 해결하는 방법 중 하나로 Blue-Green Deployment가 있다.  
+[📖] B.G.D는 배포 시 기존에 배포된 서버 그룹과는 별도로 새로운 애플리케이션을 배포할 서버 그룹을 준비, 로드 밸런서와 서비스 디스커버리 레벨에서 참조 대상을 교체하여 배포하는 방법.
+
+=> 핵심은 "서버를 고치지 않고 화살표만 바꾼다"  
+```
+RollingUpdate:  입구 → [v1][v1][v1] → [v2][v1][v1] → [v2][v2][v1] → [v2][v2][v2]
+                       (서버를 하나씩 교체, 중간에 섞임)
+
+Blue-Green:     입구 → [v1][v1][v1]  blue          입구    [v1][v1][v1]  blue
+                       [v2][v2][v2]  green   →       ↘     [v2][v2][v2]  green
+                       (입구 방향만 한 번에 전환, 안 섞임)
+```
+[📸]chap7-블루그린 캡쳐를 통해 딜레이 없이 버전이 바뀐 걸로 호출되는 걸 확인
+
 ---
-# Chap 8. 쿠버네티스 애플리케이션 패키징
+
+## 7.2 쿠버네티스에서 정기적인 배치 작업 실행하기
+### 7.2.1 크론잡
+
+**쿠버네티스에서 앱을 돌리는 세 가지 방식
+
+| 리소스 | 언제 쓰나 | 예시 | 배운 곳 |
+|---|---|---|---|
+| Deployment | **계속 떠 있어야** 하는 앱 | 웹, API 서버 | 5장 |
+| Job | **한 번 실행하고 끝나는** 작업 | DB 마이그레이터 (taskapp migrator) | 6장 |
+| CronJob | **정해진 시간마다 반복** 실행하는 작업 | 매일 새벽 통계 집계, 1시간마다 정리 작업 | 7장 |
+
+```text
+CronJob ──(스케줄마다)──→ Job ──→ Pod
+Deployment ─────────────→ ReplicaSet ──→ Pod
+```
+
+- CronJob은 스케줄 시간마다 Job을 하나씩 찍어냄 (Deployment가 ReplicaSet을 거느리는 구조와 같음)
+
+** Concurrency Policy
+
+크론잡의 다음 실행 시간이 됐는데 **이전 Job이 아직 안 끝났으면 어떻게 할지** 정하는 설정 (`.spec.concurrencyPolicy`)
+
+**언제 문제가 되나**: 작업 시간이 스케줄 간격보다 길면 겹침
+
+```text
+스케줄: 1분마다 / 작업 시간: 90초
+
+07:00  Job A 시작 ──────────────────────── 07:01:30 끝
+07:01          Job B 시작 시간!  ← A가 아직 도는 중인데 어떻게 하지?
+```
+
+| 값 | 동작 | 위 상황에서 07:01에 |
+|---|---|---|
+| `Allow` (기본값) | 겹쳐도 **같이 실행** | A와 B가 동시에 돌아감 |
+| `Forbid` | 이전 Job이 안 끝났으면 **이번 회차는 건너뜀** | B를 안 만듦. 다음 07:02에 다시 판단 |
+| `Replace` | 이전 Job을 **중단하고 새 Job으로 교체** | A를 중단하고 B를 시작 |
+
+```yaml
+spec:
+  schedule: "*/1 * * * *"
+  concurrencyPolicy: Forbid   # spec 바로 아래, schedule과 같은 레벨
+  jobTemplate:
+    ...
+```
+
+** Suspend
+
+크론잡을 **지우지 않고 일시정지**하는 설정 (`.spec.suspend`, 기본값 `false`)
+
+| 방법 | 설정 보존 | Job 기록 | 재개 |
+|---|---|---|---|
+| 크론잡 삭제 | 사라짐 | 사라짐 | 다시 apply |
+| `suspend: true` | 그대로 | 그대로 | `false`로 바꾸면 끝 |
+
+- 사용 예: DB 점검 중, 배치 버그 수정 중, 외부 API 장애 중
+- 주의: **이미 실행 중인 Job은 멈추지 않음** → 앞으로 새 Job을 만들지 않을 뿐
+
+```bash
+kubectl patch cronjob pingpong -p '{"spec":{"suspend":true}}'    # 일시정지
+kubectl patch cronjob pingpong -p '{"spec":{"suspend":false}}'   # 재개
+```
+
+### 7.2.2 타임존을 고려한 크론잡 실행
+
+- 크론잡 스케줄은 기본적으로 **UTC 기준** (kube-controller-manager의 시간대)
+- 예: `schedule: "0 9 * * *"` → 한국 시간 오전 9시가 아니라 **오후 6시**에 실행
+
+| 방법 | 문제점 |
+|---|---|
+| 예전: 컨트롤 플레인 서버의 시간대 변경 | 클러스터 전체가 한 시간대에 묶임, 매니지드 서비스(EKS 등)는 변경 불가 |
+| 1.27부터: CronJob의 `timeZone` 필드 | 크론잡마다 개별 지정 가능 |
+
+```yaml
+spec:
+  schedule: "10 12 * * *"
+  timeZone: "Asia/Seoul"    
+```
+### 7.2.3 크론잡에서 잡을 일회성으로 실행하기
+
+스케줄을 기다리지 않고 **크론잡의 jobTemplate으로 Job을 즉시 1개 생성**
+
+```bash
+kubectl create job [Job 이름] --from=cronjob/[CronJob 이름]
+kubectl create job onetime-pingpong --from=cronjob/pingpong
+kubectl logs job/onetime-pingpong      # Job 이름으로 바로 로그 확인
+```
+
+| 비교 | 스케줄로 실행 | `--from`으로 실행 |
+|---|---|---|
+| 실행 시점 | 스케줄 시간 | 명령 친 즉시 |
+| Job 이름 | 자동 (`크론잡이름-숫자`) | 내가 지정 |
+| 크론잡 설정 변경 | - | 없음 |
+
+- 사용 예: 배포 직후 동작 확인, 실패한 회차 재실행, 급하게 한 번 더 실행
+- 장점: 스케줄을 임시로 바꿨다가 되돌리는 걸 깜빡하는 사고를 막을 수 있음
+
+---
+
+## 7.3 유저 관리와 Role-Based Access Control(RBAC)
+
+**왜 필요한가**: 지금 쓰는 `docker-desktop` 계정은 클러스터 관리자 권한이라 뭐든 다 됨 → 실무에서는 위험
+- 신입이 실수로 운영 DB 파드 삭제
+- 조회만 하면 되는 사람이 배포 설정 변경
+- 앱 하나가 해킹당하면 그 권한으로 클러스터 전체 조작
+
+→ **필요한 만큼만 권한을 주는** 장치 = RBAC (Role-Based Access Control, 역할 기반 접근 제어)
+
+**쿠버네티스의 유저 두 종류** 
+
+| 구분 | 누가 쓰나 | 예시 | 관리 위치 |
+|---|---|---|---|
+| 서비스 어카운트 | **파드**(프로그램)가 쿠버네티스 API를 호출할 때 | 다른 파드 목록을 조회하는 모니터링 앱 | 쿠버네티스 리소스 (`kubectl get sa`) |
+| 일반 유저 | **사람**이 kubectl로 조작할 때 | 개발자, 운영자 (회사 EKS kubeconfig) | 클러스터 밖에서 인증 (인증서, 토큰, OIDC 등) |
+
+[🔎]서비스 어카운트 추가 설명
+--->  
+우리가 ** kubectl get pods ** 를 치면 실제로는 kubectl이 컨트롤 프레인의 api 서버에게 "파드 목록 줘" 라고 http 요청을 보내는 것.   
+이게 쿠버네티스 API 호출!  
+이 요청은 파드 안에서 도는 프로그램들도 똑같이 API 서버에 요청할 수 있음.
+
+우리 5장에서 인그레스 만들면 ingress-nginx가 알아서 라우팅해줬던 거  
+그것이 가능했던 이유는 ingress-nginx 파드가 API 서버한테 "인그레스 목록 줘" 라고 계속 물어보고 있었기 때문.  
+사람은 kubeconfig에 든 인증서로 증명이 가능하지만, 파드는 뭘로 자기를 증명하냐? 그때 쓰는 신분증이 서비스 어카운트다.
+
+서비스 어카운트는 파드나 서비스처럼 쿠버네티스 안에 리소스로 존재해서 kubectl로 조회하고 만들고 지울 수 있다.
+
+### 7.3.1 RBAC를 사용해 권한 제어 구현하기
+
+**RBAC = 역할 정의 + 연결**
+
+| 단계 | 회사 비유 | 쿠버네티스 |
+|---|---|---|
+| ① 역할 정의 | "열람실 출입 가능" 권한 카드 만들기 | Role / ClusterRole |
+| ② 연결 | 그 카드를 직원에게 발급 | RoleBinding / ClusterRoleBinding |
+
+| 비교 | 네임스페이스 하나에서만 유효 | 클러스터 전체에서 유효 |
+|---|---|---|
+| 무엇을 할 수 있나 (권한 목록) | Role | ClusterRole |
+
+[📸] chap7-서비스어카운트 
+```
+네임스페이스마다 default 있는 거 확인.
+네임스페이스를 만들면 쿠버네티스가 자동으로 하나씩 만들어주는 기본 신분증.
+매니페스트에 serviceAccountName을 안적으면 파드는 이걸 달고 뜬다.
+
+```
+
+---
+
+### 7.3.2 클러스터 롤 생성 [권한 카드 만들기]
+
+| 필드 | 값 | 의미 |
+|---|---|---|
+| `apiGroups` | `[""]` | 코어 API 그룹 (빈 문자열 = 코어) |
+| `resources` | `["pods"]` | 대상은 파드 |
+| `verbs` | `["get", "watch", "list"]` | 하나 조회, 변화 감시, 목록 조회만 허락 |
+
+→ **"모든 파드를 조회만 할 수 있음"** (create / update / delete 없음)
+
+**apiGroups 값 찾기**: 매니페스트의 `apiVersion` 슬래시 앞부분 (`kubectl api-resources --sort-by name`)
+
+[🔎] apiGroups로 랄지부르스 이유 뭐야? 뭔데 이게?
+==> 그냥 규약이라고 생각하면 됨. 정해져있는 리소스고 갖다쓰면 되는 고정 값.
+
+---
+
+### 7.3.3 서비스 어카운트 생성 [직원 등록]
+
+```
+apiVersion: v1           # ServiceAccount는 코어 그룹 (슬래시 없음)
+kind: ServiceAccount     # 직원(신분증)을 만든다
+metadata:
+  name: pod-reader       # 직원 이름은 pod-reader
+```
+
+** name이 같다고 자동연결 X 지금 여기까지는 권한 카드 만들었고, 직원 등록만 한 상태. 연결 XXX
+
+---
+
+### 7.3.4 클러스터 롤 바인딩 생성 [카드를 직원한테 주기]
+
+```
+kind: ClusterRoleBinding        # 카드를 직원한테 주는 "발급 기록"
+metadata:
+  name: pod-reader              # 발급 기록의 이름
+subjects:                       # 누구에게? 
+- kind: ServiceAccount          #   서비스 어카운트인
+  name: pod-reader              #   pod-reader 직원에게
+  namespace: default            #   (default 네임스페이스에 등록된)
+roleRef:                        # 어떤 카드를? ↓
+  kind: ClusterRole             #   ClusterRole인
+  name: pod-reader              #   pod-reader 카드를
+  apiGroup: rbac.authorization.k8s.io
+```
+
+여기까지 진행하면 이제 연결 된 것.
+그럼 출입 테스트를 해보자.  
+
+pod-reader 신분증으로 파드 띄우기
+```
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-reader
+  labels:
+    app: pod-reader
+spec:
+  serviceAccountName: pod-reader   # 이 파드는 pod-reader 신분증을 달고 실행된다
+  containers:
+   . . . . . . . . . 
+```
+=> [📖] 그림 7.6 pod-reader가 출력하는 파드 리스트 
+
+``` serviceAccountName: pod-reader ``` 를 안적으면 default 신분증이 붙어버리고, default에는 아무 권한이 없기때문에 조회가 거절됨.
+
+그럼, 같은 카드로 허락 안 된 걸 시도하면 거절당하는 지 확인해보자는 것이 다음.  
+
+[📸]chap8-잘못된권한조회
+
+pod-reader은 "파드" 대상 권한 okay인데, 상위 레벨인 디플로이먼트에 pod-reader 권한을 추가하고 가져오도록 명렁해보니
+에러가 뜨는 걸 확인.
+
+
+---
+
+### 7.3.5 일반 유저 [직원카드 복사본으로 출입하는 임시출입증]
+
+[📸]chap7-임시출입증발급로그
+```
+1. cluster -> 어느 건물 / authinfo -> 어떤 카드
+2. 임시 출입증 발급
+3. 내 지갑에 넣음.
+4. 임시 출입증에 포스트잇 "docker-desktop 건물에는 local-pod-reader 출입증으로 들어간다" 를 붙여놓기.
+5. 현재 내 지갑에는 카드 두장이 있는 것. 하나는 관리자 카드, 하나는 임시 출입증
+[📸]chap7-임시출입증발급로그2
+6. 카드 임시출입증으로 바꿔들고 들어가기~
+
+==> 전부 이 전에 봤던 똑같은 결과가 터미널에 출력됨을 확인.
+```
+
+---
+# Chapter 8. 쿠버네티스 애플리케이션 패키징
+
+? 왜 필요한가 ?
+
+- 지금까지는 로컬 환경 하나뿐이었음
+- 실무에서는 **같은 앱을 여러 클러스터(환경)에 배포**함
+
+| 환경 | 다른 점 |
+|---|---|
+| dev | replicas 1, 도메인 `dev-echo.회사.com` |
+| prod | replicas 5, 도메인 `echo.회사.com` |
+
+- 매니페스트를 환경마다 통째로 복사하면 → 이미지 버전 하나 올릴 때마다 모든 사본을 수정해야 함 → 하나라도 빠뜨리면 사고
+- 해결: **공통 부분은 한 벌만 두고, 환경별 차이만 따로 관리**
+
+| 도구 | 방식 | 저자의 구분 |
+|---|---|---|
+| Kustomize (8.1) | 원본 YAML + 바꿀 부분만 **덮어쓰기** | 환경별 **최소한의 차이**만 관리할 때 |
+| Helm (8.2) | YAML **템플릿**에 값을 채워 넣기 | 세밀한 제어가 필요할 때, 남에게 배포하거나 오픈소스로 공개할 때 |
+
+## 8.1 Kustomize 
+
+환경별 차이를 적용하려면 먼저 바뀌지 않는 공통 부분이 있어야하고, 그걸 만들거야 (base)  
+웹앱 하나를 쿠버네티스에 올리는 데 필요한 최소 세트인   
+Deployment / Service / Ingress 각각의 베이스를 만들자.  
+[📸] 리스트 8.2 echo 애플리케이션의 디플로이먼트 매니페스트 파일 (~/k8s/kustomize/echo/base/deployment.yaml)  
+
+그리고 그 세개의 베이스를 하나로 합치자.
+[📸]리스트 8.6 kustomize create --autodetect로 생성된 kustomization.yaml (~/k8s/kustomize/echo/base/
+kustomization.yaml)
+
+
+
+
