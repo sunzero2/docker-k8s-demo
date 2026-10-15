@@ -1443,14 +1443,413 @@ pod-reader은 "파드" 대상 권한 okay인데, 상위 레벨인 디플로이�
 ## 8.1 Kustomize 
 
 환경별 차이를 적용하려면 먼저 바뀌지 않는 공통 부분이 있어야하고, 그걸 만들거야 (base)  
-웹앱 하나를 쿠버네티스에 올리는 데 필요한 최소 세트인   
+
+1️⃣ 웹앱 하나를 쿠버네티스에 올리는 데 필요한 최소 세트인   
 Deployment / Service / Ingress 각각의 베이스를 만들자.  
 [📸] 리스트 8.2 echo 애플리케이션의 디플로이먼트 매니페스트 파일 (~/k8s/kustomize/echo/base/deployment.yaml)  
 
-그리고 그 세개의 베이스를 하나로 합치자.
+2️⃣ 그리고 그 세개의 베이스를 하나로 합치자.
 [📸]리스트 8.6 kustomize create --autodetect로 생성된 kustomization.yaml (~/k8s/kustomize/echo/base/
 kustomization.yaml)
 
+[🔎] 하나로 합치는 이유는 뭐야?
+1. 폴더 하나를 배포단위 1개로 다룰 수 있다.
+2. 공통 설정을 한 곳에서 한번에 입힐 수 있다.
+3. overlay가 이 base를 가져다 쓸 수 있다.
+
+3️⃣ 공통 레이블을 kustomization.yaml 한 곳으로 (p.306~308)
+- 문제: `app.kubernetes.io/name: echo`가 deployment/service/ingress 3개 파일에 6번 중복
+- 해결: kustomization.yaml에서 한 번만 설정
+  - 리스트 8.13 (p.307) `kustomize edit set label "app.kubernetes.io/name:echo"`
+  - 리스트 8.14 (p.307) `commonLabels`가 추가된 kustomization.yaml
+  - `kustomize build .` 결과는 이전과 동일!
+- `commonLabels`는 deprecated 예정 → `kustomize edit fix`로 변환하셔라~
+
+4️⃣ 오버레이로 환경별 차이 적용 (p.309~312)
+- 디렉터리 구조: `base/` (공통) + `overlays/dev/` (환경별)
+- dev의 kustomization.yaml 생성 → `resources: ../../base` (오버레이 하기 전 베이스 가져오기~)
+- 패치 방식 2가지
+
+```
+값을 덮어쓰려면 방법이 필요한데, 그 방법의 이름이 Strategic Merge Patch.
+Deployment는 이 방식으로 됐는데 Ingress의 host는 이 방식으로 안됨.  
+그 대안이 JSON Patch
+```
+** 패치 방식 선택 기준
+- Strategic Merge Patch: 바꿀 부분만 원본 모양으로 작성. 리스트 항목은 name 같은 식별 값으로 짝을 맞춤
+  - 예) replicas 변경, env의 BACKEND_MAX_FAILS value 변경 (식별 값은 그대로, 값만 변경)
+- JSON Patch: op/path/value로 경로를 직접 지정
+  - 예) Ingress host 변경 (host가 곧 식별 값이라 Strategic Merge로 위치를 못 찾음)
+- 판단 기준: 식별 값(이름표)을 건드리지 않으면 Strategic Merge, 식별 값 자체를 바꾸거나 경로로 찍어야 하면 JSON Patch
+
+[🔎] 이해가 너무 않되,,  
+-->  
+ #### Ingress `rules`와 host
+
+- `rules`는 "이 host로 들어온 요청은 이 경로로 이 Service에 보내라"를 정의하는 **리스트**. 규칙을 여러 개 둘 수 있다.
+
+```yaml
+spec:
+  ingressClassName: nginx          # 어떤 Ingress Controller가 처리할지 (ingress-nginx)
+  rules:                           # 라우팅 규칙 목록
+  - host: echo.jpub.local          # ① 이 도메인으로 들어오면
+    http:
+      paths:
+      - pathType: Prefix
+        path: /                    # ② 이 경로(/ 이하 전부)는
+        backend:
+          service:
+            name: echo             # ③ echo Service의
+            port:
+              number: 80           #    80번 포트로 보내라
+```
+
+- 도메인별로 echo.jpub.local → echo, admin.jpub.local → admin Service로 나눌 수 있고,
+  한 도메인 안에서도 `/api`와 `/`를 다른 Service로 보낼 수 있다.
+- `host`는 규칙 하나를 구분하는 이름 역할을 한다.
+
+#### 이래도 이해가 안돼서 비유로 알랴달라함 ㅋ
+
+환자 차트 보관함에서 차트를 고치는 상황으로 비유한다.
+
+- **"김철수 환자의 연락처를 바꿔줘"** → 가능
+  - 이름으로 차트를 찾고 연락처만 고치면 되므로, 찾는 기준(이름)과 바꾸는 값(연락처)이 다르다.
+  - (env의 `name: BACKEND_MAX_FAILS`로 항목을 찾고 `value`만 바꾸는 경우)
+- **"김철수 환자의 이름을 이영희로 바꿔줘"를 이름으로 찾으라고 시키면** → 곤란
+  - 보관함에 이영희 차트는 없으니 어느 차트를 고치라는 건지 알 수 없다.
+  - (Ingress의 `host`를 `host` 값으로 찾으려는 경우)
+- **해결: 이름 대신 위치로 지정** → "3번 서랍의 첫 번째 차트의 이름을 이영희로 바꿔"
+  - (JSON Patch의 `/spec/rules/0/host`)
+
+| | Strategic Merge | JSON Patch |
+|---|---|---|
+| 항목 찾는 법 | 이름(식별 값)으로 | 위치(경로)로 |
+| 이름 자체를 바꿀 수 있나 | 불가 (찾는 기준이 사라지니까) | 가능 (위치로 찾으니까) |
+
+- 리스트 8.21 (p.312) 패치 등록
+  - Strategic Merge: `kustomize edit add patch --path patch-deployment.yaml`
+  - JSON Patch: `kustomize edit add patch --kind Ingress --path patch-ingress.yaml --name echo` (패치 파일만으로 대상을 알 수 없어 `--kind`/`--name` 필요)
+- 효과: 환경마다 YAML 복붙 없이 base 한 벌 + 바뀌는 부분만 관리
 
 
+### 8.1.3 Kustomize에서 시크릿 다루기
+
+문제: Secret 매니페스트는 값이 base64로 들어가는데, 이건 암호화가 아니라 인코딩일 뿐이라 이 파일을 Git에 올리면 비밀번호가 노출됨!
+
+해결: 
+MySQL 파드가 읽는 Secret 오브젝트가 클러스터에 있어야 한다. 원래는 그 Secret YAML을 직접 써야 했는데(비밀번호가 든 파일이라 Git 관리도 번거로움), secretGenerator는 비밀번호 메모 파일만 두면 build 때 Secret을 대신 만들어준다.
+
+---
+[🔎] 이해안돼서 또 물어봄;
+- MySQL 파드는 비밀번호를 **클러스터 안의 Secret 오브젝트**에서 읽는다 (StatefulSet의 `secretName: mysql`). 내 PC의 파일은 파드가 읽을 수 없다.
+- 그래서 Secret 오브젝트가 클러스터에 있어야 하는데, 직접 만들면 비밀번호가 base64로 든 Secret YAML이 생긴다.
+  - base64는 암호화가 아니라 인코딩일 뿐이라 (`echo <값> | base64 -d`로 바로 복원됨) Git에 올리면 안 되고, 제외 관리가 번거롭다.
+- **secretGenerator**: 비밀번호가 든 **텍스트 파일(재료)**만 두면 `kustomize build` 때 Secret YAML을 대신 만들어준다.
+  - Git에는 Secret YAML이 아예 없고, 비밀번호 파일만 제외하면 된다.
+
+#### 진행 순서
+| 단계 | 내용 | 책 |
+|---|---|---|
+| ① | StatefulSet 작성, `kustomize create --autodetect` | 리스트 8.24~8.26 (p.314~316) |
+| ② | 비밀번호 파일 생성 + `secretGenerator` 등록 | 리스트 8.27 (p.316) |
+| ③ | Headless Service 추가, 공통 라벨 설정 | 리스트 8.28~8.29 (p.317) |
+| ④ | `kustomize build`로 Secret 생성 확인 | 리스트 8.30 (p.318~319) |
+
+#### 핵심 커맨드
+```bash
+# 재료: 비밀번호 파일 (-n: 줄바꿈이 비밀번호에 섞이지 않게)
+echo -n "your-root-password" > mysql_root_password
+echo -n "your-user-password" > mysql_user_password
+
+# secretGenerator 등록
+kustomize edit add secret mysql --from-file=root_password=./mysql_root_password
+kustomize edit add secret mysql --from-file=user_password=./mysql_user_password
+
+# Service를 관리 대상에 추가, 공통 라벨 설정
+kustomize edit add resource service.yaml
+kustomize edit set label "app.kubernetes.io/component:mysql"
+```
+
+#### 완성된 kustomization.yaml (리스트 8.29)
+```yaml
+resources:
+- statefulset.yaml            # kustomize create --autodetect가 자동 등록 (①)
+- service.yaml                # kustomize edit add resource service.yaml로 우리가 수동 등록 (③)
+secretGenerator:              # kustomize edit add secret ... 으로 등록 (②)
+- files:
+  - root_password=./mysql_root_password   # 이 파일 내용을 root_password 항목으로
+  - user_password=./mysql_user_password   # 이 파일 내용을 user_password 항목으로
+  name: mysql                              # 생성될 Secret 이름 (build 때 해시가 붙음)
+  type: Opaque
+labels:                       # kustomize edit set label → edit fix 로 변환된 형태 (③)
+- includeSelectors: true      # selector에도 라벨 주입
+  pairs:
+    app.kubernetes.io/component: mysql
+```
+
+#### build 결과에서 확인한 것 (리스트 8.30)
+- **Secret이 생성됨**: `kind: Secret`, `data`의 값은 base64. 우리가 Secret YAML을 쓴 적은 없다.
+- **이름에 해시 접미사**: `mysql-867k2ghhm5`
+  - 내용에서 계산된 값이라 비밀번호가 바뀌면 해시도 바뀜 → StatefulSet이 가리키는 이름이 바뀜 → 파드 템플릿이 달라져 **파드가 자동 재시작**됨
+- **참조 이름 자동 연결**: StatefulSet의 `secretName: mysql` → `secretName: mysql-867k2ghhm5`
+- **라벨이 7곳에 주입됨**: Secret, Service(metadata + `spec.selector`), StatefulSet(metadata, `selector.matchLabels`, `template.metadata.labels`), volumeClaimTemplates
+  - `selector`는 우리가 쓰지 않았는데 `includeSelectors: true`로 자동 생성됨
+
+#### 참고: Headless Service (`clusterIP: None`)
+- StatefulSet 파드는 `mysql-0`, `mysql-1`처럼 **순번이 고정된 이름**을 가진다 (Deployment 파드는 랜덤 이름).
+- 일반 Service는 가상 IP 하나로 아무 파드에나 분배하지만, DB는 특정 파드를 지목해야 한다.
+- Headless Service는 가상 IP 없이 DNS가 파드별 주소를 준다 (`mysql-0.mysql.default.svc.cluster.local`).
+- StatefulSet의 `serviceName: "mysql"`이 이 Service를 가리키므로 같은 이름의 Service가 필요하다.
+
+#### 정리
+- Secret 오브젝트는 클러스터에 있어야 한다. secretGenerator는 그 YAML을 대신 만들어주는 것.
+- Git 관리 대상: `statefulset.yaml`, `service.yaml`, `kustomization.yaml` / 제외 대상: `mysql_*_password` 파일
+
+
+---
+
+### 8.1.4 네트워크를 경유해서 매니페스트 생성하기
+
+: 3줄요약
+
+우와! github 주소를 resouces에 넣어서 남의 메니페스를 가져올 수 있구나!  
+내 로컬에 메니페스트 파일이 하나도 없는데! 리소수가 출력되잖아!  
+신기하군~  
+
+---
+
+
+## 8.2 Helm (p.322~)
+
+### Helm이란
+- **Helm**은 CNCF가 관리하는 쿠버네티스용 **패키지 관리 도구**이고, **Chart**는 쿠버네티스 리소스와 설정을 정리한 **패키지**다.
+- Chart는 여러 매니페스트의 **템플릿**을 정리한 것이다. 대규모 앱이면 하위 Chart로 나누거나, 다른 Chart와 의존 관계를 가질 수 있다.
+- 서드 파티 Chart 리포지터리에서 Chart를 받아 쓸 수 있다.
+- 실무에서는 환경(로컬, 운영)에 상관없이 배포할 앱이라면 Chart로 패키징하고, `kubectl`이 아니라 Helm으로 배포와 업데이트를 하며, `kubectl`은 배포된 리소스를 일시적으로 수정할 때 쓴다.
+
+### 개념 비유 (Java 개발자 기준)
+| 개념 | 비유 |
+|---|---|
+| Helm | Maven/Gradle 같은 패키지 관리 도구 |
+| Chart | 라이브러리 패키지 (jar) |
+| Chart 리포지터리 | Maven Central 같은 저장소 |
+| `helm install` | 의존성을 받아서 설치 |
+
+### Kustomize와의 차이
+| | Kustomize | Helm |
+|---|---|---|
+| 방식 | 완성된 YAML 위에 **패치**를 덮어씀 (템플릿 없음) | YAML **템플릿**에 values를 넣어서 생성 |
+| 변경 지점 | 패치로 일부만 바꿈 | `values.yaml`의 변수만 바꿈 |
+| 남이 만든 걸 쓸 때 | GitHub URL을 `resources`에 넣음 (8.1.4) | 리포지터리에서 Chart를 받아 `helm install` |
+| 설치 이력 관리 | 없음 (`kubectl apply`가 담당) | **릴리스**로 관리 (업그레이드/롤백 가능) |
+
+### 8.2 진행 순서
+| 단계 | 내용 | 책 |
+|---|---|---|
+| ① | Helm 설치 (`asdf`) | 리스트 8.35 (p.323~324) |
+| ② | Chart 리포지터리 추가, 검색 | 리스트 8.36~8.38 (p.324~325) |
+| ③ | Chart 구조 파악 | 리스트 8.39 (p.326) |
+| ④ | `bitnami/mysql` 설치, values 덮어쓰기 | 리스트 8.40~ (p.327~) |
+
+
+---
+
+#### Kustomize vs Helm: 같은 목표(MySQL + 비밀번호)를 푸는 방식
+
+**목표**: StatefulSet, Service, Secret이 필요하고, 비밀번호는 내가 정한 값을 넣고 싶다.
+
+#### Kustomize 방식 (8.1.3)
+매니페스트를 **내가 직접 쓰고**, 비밀번호만 별도 파일로 뺀다.
+
+```
+내가 직접 씀:  statefulset.yaml, service.yaml
+재료 파일:     mysql_root_password (비밀번호 글자)
+설정:          kustomization.yaml (secretGenerator 등록)
+         ↓ kustomize build
+출력:          Secret(자동 생성) + StatefulSet + Service
+```
+
+#### Helm Chart 방식 (8.2)
+매니페스트를 **Chart 제작자가 이미 만들어 두었고**, 나는 바꿀 값만 적는다.
+
+```
+남이 만들어 둠:  templates/ (statefulset, service, secret ... 템플릿들)
+                 values.yaml (기본값)
+내가 쓰는 것:    mysql.yaml (덮어쓸 값만: rootPassword 등)
+         ↓ helm template / helm install
+출력:           Secret + StatefulSet + Service + ... (전부 생성)
+```
+
+#### 파일 대응표
+| 역할 | Kustomize | Helm Chart |
+|---|---|---|
+| 매니페스트 | 내가 쓴 `statefulset.yaml` (완성된 YAML) | `templates/*.yaml` (`{{ }}`가 든 **템플릿**) |
+| 비밀번호 같은 값 | `mysql_root_password` 파일 | `values.yaml`의 `auth.rootPassword` |
+| 내 값으로 바꾸기 | 파일 내용을 바꿈 | `mysql.yaml`로 덮어씀 |
+| Secret 생성 | `secretGenerator` 설정 | `templates/secrets.yaml`이 처리 |
+| 만드는 명령 | `kustomize build` | `helm template` / `helm install` |
+
+#### Chart 구성 (p.326, 리스트 8.39)
+```
+chart-name/
+├─ Chart.yaml        # Chart 정보
+├─ charts/           # 의존 Chart
+├─ templates/        # 매니페스트 템플릿 (+ NOTES.txt, _helpers.tpl)
+└─ values.yaml       # 템플릿 변수의 기본값
+```
+- 기본값은 `values.yaml`, 바꾸려면 **커스텀 values 파일**로 덮어쓴다.
+
+#### 커스텀 values로 덮어쓰기 (리스트 8.41)
+```yaml
+# mysql.yaml : 덮어쓸 항목만 적는다
+auth:
+  rootPassword: root_password
+  database: ch08
+  username: jpub
+  password: jpub_password
+```
+- Kustomize의 `mysql_root_password` 파일에 대응 (비밀번호를 쓰는 곳)
+
+#### helm install / upgrade / delete (p.328~331)
+
+- 릴리스명은 네임스페이스 안에서 고유하며 업데이트, 삭제 때 필요
+
+### 8.2.4 자체 Chart 생성하기
+
+#### 템플릿 문법 3가지
+
+| 문법 | 의미 | Kustomize에서 비슷한 것 |
+|---|---|---|
+| `{{ .Values.nginx.port }}` | `values.yaml`의 `nginx:` → `port:` 값을 여기에 넣는다 | 패치로 덮어쓸 그 값 자리 |
+| `{{ include "echo.fullname" . }}` | `_helpers.tpl`에 만들어 둔 조각(이름 규칙)을 가져와 쓴다 | `namePrefix` 같은 공통 규칙 (자바로 따지면 유틸 메서드를 모아둔 클래스같은 거)|
+| `{{- if ... }}` / `{{- with ... }}` | 조건에 맞을 때만 이 블록을 출력한다 | 없음 (패치는 조건 없이 적용) |
+
+### 완성본 → 템플릿 변환 (값이 박혀 있던 자리를 변수로)
+```yaml
+# 완성본 (리스트 8.48)                          # 템플릿 (리스트 8.49)
+name: echo                                      name: {{ include "echo.fullname" . }}
+replicas: 1                                     replicas: {{ .Values.replicaCount }}
+image: ghcr.io/.../simple-nginx-proxy:v0.1.0    image: "{{ .Values.nginx.image.repository }}:{{ .Values.nginx.image.tag }}"
+value: "3"   # BACKEND_MAX_FAILS                value: "{{ .Values.nginx.maxFails }}"
+```
+- 값이 박혀 있던 자리가 `.Values.xxx`로 바뀌고, 그 값은 `values.yaml`에 정리한다 (리스트 8.50)
+- 구조가 실제로 달라지는 부분은 `containers`뿐이다 
+
+### 과도한 변수화는 피한다 (p.336, 리스트 8.51)
+- 모형은 가능한 모든 항목을 변수화하지만, 과하면 조정 시간이 늘어난다.
+- 외부 공개용 Chart가 아니면 `80`처럼 정해진 값은 직접 적어도 된다.
+- 기본값은 템플릿에서 지정할 수도 있다.
+```yaml
+value: {{ .Values.nginx.port | default "80" }}
+```
+
+#### echo Chart 만들기 (p.332~346) — Kustomize(8.1)와 비교
+
+같은 echo 앱을 Kustomize는 **base + overlay**로, Helm은 **Chart + values**로 만든다.
+
+| 단계 | Kustomize (8.1.1~8.1.2) | Helm (8.2.4) | 책 |
+|---|---|---|---|
+| ① 뼈대 | 매니페스트 3개를 직접 작성 | `helm create echo`로 뼈대 생성 후 불필요한 템플릿 삭제 | 8.46~8.47 |
+| ② 매니페스트 | 완성된 YAML | 뼈대의 템플릿을 echo에 맞게 수정 (Deployment만) | 8.48~8.49 |
+| ③ 값 | YAML 안에 박혀 있음 | `values.yaml`에 모음 | 8.50 |
+| ④ 환경별 값 | `overlays/dev` + 패치 파일 | 커스텀 values 파일 (`-f`) | 8.63 |
+| ⑤ 미리보기 | `kustomize build .` | `helm template` (= **렌더링**) | 8.60 |
+| ⑥ 배포 | `build \| kubectl apply -f -` | `helm package` → `helm install` | 8.62, 8.64 |
+
+#### ① 뼈대 만들기 (리스트 8.46~8.47)
+```bash
+helm create echo
+rm -rf hpa.yaml serviceaccount.yaml tests      # 최신 Helm은 httproute.yaml도 삭제
+```
+- Kustomize의 `kustomize create --autodetect`가 `kustomization.yaml`을 만들어 주듯, Helm은 **폴더 구조 전체**를 만들어 준다.
+- 지우는 것: `hpa.yaml`(파드 수 자동 조절, 9장), `serviceaccount.yaml`, `tests/`(Chart 품질 테스트)
+
+#### ②~③ templates와 values.yaml의 관계
+- `templates/deployment.yaml` = **빈칸이 있는 양식**, `values.yaml` = **빈칸에 들어갈 값을 적어둔 목록** (서로 다른 파일)
+- `{{ .Values.nginx.maxFails }}`는 `values.yaml`의 `nginx:` → `maxFails:` 값을 찾아 채운다. 들여쓰기 계층이 점(`.`)으로 이어지는 경로가 된다.
+- 리스트 8.50의 "디플로이먼트에 대응하는 부분" = Deployment 템플릿의 빈칸들에 들어갈 값 (`nginx:`, `echo:` 블록)
+- [🔎] `include "echo.fullname"`을 쓰는 이유 ???   
+ 이름이 **설치마다 달라져야** 하기 때문이다. 같은 Chart를 `dev`, `prod` 릴리스로 두 번 설치하면 `dev-echo`, `prod-echo`로 갈라져 이름 충돌이 없다. (한 번만 설치한다면 직접 적어도 된다)
+
+#### Service, Ingress: 템플릿은 그대로, values만 수정 (리스트 8.52~8.58)
+- 책: Service 템플릿(8.53)과 Ingress 템플릿(8.56)은 **수정이 필요 없다**. 뼈대 그대로 쓴다.
+- Kustomize에서는 둘 다 YAML을 직접 썼지만, Helm은 `values.yaml`의 스위치와 값만 바꾼다.
+
+| `values.yaml` 항목 | 뼈대 기본값 | echo용 | 이유 |
+|---|---|---|---|
+| `ingress.enabled` | `false` | `true` | 기본은 Ingress를 안 만듦 |
+| `ingress.className` | `""` | `"nginx"` | 사용하는 Ingress Controller |
+| `pathType` | `ImplementationSpecific` | `Prefix` | 책과 같이 변경 |
+| `serviceAccount.create` | `true` | `false` | echo는 별도 계정 불필요 (이 설정이면 헬퍼가 `default` 계정을 반환) |
+
+- Ingress의 `host: chart-example.local`은 뼈대의 **자리표시용 예시 값**이다. 기본값은 두고 설치할 때 덮어쓴다.
+
+#### ⑤ 렌더링 확인 (리스트 8.60)
+- `helm template echo ./echo`로 Service, Deployment, Ingress가 에러 없이 나오는지 설치 전에 확인한다 (Kustomize의 `build`에 해당).
+- 값만 바꿔서 결과가 달라지는지는 `--set`으로 확인한다 (dev 오버레이가 하던 일).
+```bash
+helm template echo ./echo -s templates/deployment.yaml --set replicaCount=3 --set nginx.maxFails=10
+```
+
+#### ⑥ 패키징 (리스트 8.61~8.62)
+```yaml
+# Chart.yaml
+apiVersion: v2
+name: echo
+description: Jpub echo application chart for Kubernetes
+type: application
+version: 0.0.0        # Chart 자체 버전 (패키징할 때마다 올림)
+appVersion: "0.0.0"   # 앱 고유 버전
+```
+```bash
+helm package echo     # echo-0.0.0.tgz 생성 (패키지 = Chart 폴더를 묶은 tgz)
+tar tzf echo-0.0.0.tgz
+```
+- 파일명은 `name`과 `version`에서 나온다. 버전을 올려 다시 패키징하면 `echo-0.0.1.tgz`가 된다.
+- Kustomize에는 이 패키징 단계가 없다 (폴더 그대로 Git으로 관리).
+
+#### ④⑥ 커스텀 values로 덮어쓰고 설치 (리스트 8.63~8.64)
+```yaml
+# local-echo.yaml : 바꿀 항목만 적는다
+ingress:
+  hosts:
+    - host: ch08-echo.jpub.local
+      paths:
+        - path: /
+          pathType: Prefix
+```
+```bash
+helm install echo ./echo-0.0.0.tgz -f local-echo.yaml      # 첫 echo = 릴리스명
+helm ls
+curl http://localhost -H 'Host: ch08-echo.jpub.local'      # Hello Container!!
+```
+- Chart 안의 `values.yaml`은 고치지 않고, **설치할 때** 값만 덮어쓴다. 그래야 같은 Chart를 환경별 values로 재사용한다.
+- 환경을 늘리려면 `dev-echo.yaml`을 만들고 **릴리스명을 다르게** 설치한다.
+```bash
+helm install dev-echo ./echo-0.0.0.tgz -f dev-echo.yaml
+```
+
+#### 설치 후 확인
+- `kubectl get deployment` → `READY 1/1`
+- `curl`이 `Hello Container!!`을 반환하면 요청이 **Ingress → Service → 파드(nginx → echo)** 까지 통과한 것이다. 이로써 Deployment/Service/Ingress 템플릿, host 덮어쓰기, `className: nginx` 연결이 모두 확인된다.
+
+#### 릴리스 관리 (Kustomize에 없는 부분, p.331)
+```bash
+helm ls                                      # 설치된 릴리스 목록
+helm upgrade echo ./echo-0.0.1.tgz -f local-echo.yaml     # Chart/values 변경 반영
+helm delete echo                             # 삭제 (릴리스명 지정)
+```
+
+#### 같은 echo, 두 방식 한눈에
+| | Kustomize | Helm |
+|---|---|---|
+| 매니페스트 | 완성된 YAML을 직접 작성 | 템플릿(빈칸) + values(값) |
+| 환경별 변경 | `overlays/`에 패치 파일 (Strategic Merge, JSON Patch) | 환경별 values 파일 (`-f`, `--set`) |
+| 미리보기 | `kustomize build` | `helm template` (렌더링) |
+| 배포 | `kubectl apply` | `helm install` (릴리스로 기록) |
+| 패키지 | 없음 (폴더를 Git으로) | `helm package` → tgz |
+| 강점 | 단순, 템플릿 없이 패치 | 조건 분기 등 세밀한 제어, 하나의 Chart로 여러 환경 대응 |
+
+
+# 마지막 8.2.5 Chart를 레지스트리에 등록하기는 제외하였습니다.
 
